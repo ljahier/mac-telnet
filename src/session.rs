@@ -13,7 +13,9 @@ use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 const KEEPALIVE_INTERVAL_SEC: u64 = 10;
-const RETRANSMIT_INTERVALS_US: &[u64] = &[1000000, 1000000, 1000000]; // 1 second intervals
+// According to protocol spec:
+// +0, +5,000, +10,000, +20,000, +40,000, +80,000, +160,000 microseconds
+const RETRANSMIT_INTERVALS_US: &[u64] = &[0, 5000, 10000, 20000, 40000, 80000, 160000];
 const AUTH_RETRY_ATTEMPTS: usize = 3;
 const AUTH_RETRY_DELAY_MS: u64 = 2000;
 
@@ -113,12 +115,22 @@ impl Session {
         match channel.rx.next() {
             Ok(packet) => {
                 if packet.len() < 22 {
+                    debug!("Received packet too short: {} bytes", packet.len());
                     return Ok(None);
                 }
 
                 if let Some(header) = Header::from_bytes(&packet[0..22], true) {
                     let payload = packet[22..].to_vec();
+                    debug!(
+                        "Received packet: type={:?}, srcMAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, counter={}",
+                        header.ptype,
+                        header.srcaddr[0], header.srcaddr[1], header.srcaddr[2],
+                        header.srcaddr[3], header.srcaddr[4], header.srcaddr[5],
+                        header.counter
+                    );
                     return Ok(Some((header, payload)));
+                } else {
+                    debug!("Failed to parse header from packet");
                 }
                 Ok(None)
             }
@@ -127,15 +139,41 @@ impl Session {
     }
 
     fn is_packet_for_me(&self, header: &Header) -> bool {
+        // Check if packet is destined for our MAC address
         if header.dstaddr != self.src_mac {
+            debug!(
+                "Packet not for us: dst={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, our={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                header.dstaddr[0], header.dstaddr[1], header.dstaddr[2], header.dstaddr[3], header.dstaddr[4], header.dstaddr[5],
+                self.src_mac[0], self.src_mac[1], self.src_mac[2], self.src_mac[3], self.src_mac[4], self.src_mac[5]
+            );
             return false;
         }
 
+        // Before authentication, accept packets from the router MAC we're connecting to
         if self.auth_state != AuthState::Authenticated {
-            return header.srcaddr == self.dst_mac;
+            let matches = header.srcaddr == self.dst_mac;
+            if !matches {
+                debug!(
+                    "Packet source MAC not matching target router: src={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, router={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                    header.srcaddr[0], header.srcaddr[1], header.srcaddr[2], header.srcaddr[3], header.srcaddr[4], header.srcaddr[5],
+                    self.dst_mac[0], self.dst_mac[1], self.dst_mac[2], self.dst_mac[3], self.dst_mac[4], self.dst_mac[5]
+                );
+            }
+            return matches;
         }
 
-        header.srcaddr == self.dst_mac && header.seskey == self.seskey
+        // After authentication, check both MAC and session key
+        let mac_matches = header.srcaddr == self.dst_mac;
+        let key_matches = header.seskey == self.seskey;
+
+        if !mac_matches || !key_matches {
+            debug!(
+                "Authenticated packet validation: srcMAC_match={}, seskey_match={} (got=0x{:x}, expected=0x{:x})",
+                mac_matches, key_matches, header.seskey, self.seskey
+            );
+        }
+
+        mac_matches && key_matches
     }
 
     fn extract_control_packet(&self, payload: &[u8]) -> Option<ControlPacket> {
@@ -176,22 +214,41 @@ impl Session {
         ptype: PacketType,
         payload: &[u8],
     ) -> Result<bool, MacTelnetError> {
+        // Send initial packet
+        self.send_packet(ptype, payload)?;
+
+        // Try to get an ACK after each transmission with appropriate wait periods
         for delay in RETRANSMIT_INTERVALS_US {
-            if delay > &0 {
+            // Wait for the specified delay
+            if *delay > 0 {
                 sleep(Duration::from_micros(*delay)).await;
             }
 
-            self.send_packet(ptype, payload)?;
-
-            // Check for acknowledgment
-            match self.receive_packet()? {
-                Some((header, _)) if header.ptype == PacketType::Ack => {
-                    return Ok(true);
+            // Check multiple times for an ACK during this interval
+            for _ in 0..5 {
+                match self.receive_packet()? {
+                    Some((header, _)) => {
+                        // Check if it's an ACK packet and it's for us
+                        if header.ptype == PacketType::Ack && self.is_packet_for_me(&header) {
+                            info!("Received ACK packet with counter={}", header.counter);
+                            return Ok(true);
+                        }
+                    }
+                    None => {
+                        // No packet received, continue checking
+                        sleep(Duration::from_millis(10)).await;
+                    }
                 }
-                _ => continue,
+            }
+
+            // No ACK received during this interval, retransmit
+            if delay < RETRANSMIT_INTERVALS_US.last().unwrap_or(&0) {
+                info!("Retransmitting packet after {}μs delay", delay);
+                self.send_packet(ptype, payload)?;
             }
         }
 
+        info!("No ACK received after all retransmission attempts");
         Ok(false)
     }
 
@@ -226,86 +283,119 @@ impl Session {
                 sleep(Duration::from_millis(AUTH_RETRY_DELAY_MS)).await;
             }
 
+            // Send BeginAuth packet
             let begin_auth = self.authenticator.generate_begin_auth();
             info!("Sending BeginAuth packet...");
             self.send_packet(PacketType::Data, &begin_auth.to_bytes())?;
             self.auth_state = AuthState::BeginAuthSent;
 
-            let username_packet = self.authenticator.generate_username();
-            info!("Sending username...");
-            self.send_packet(PacketType::Data, &username_packet.to_bytes())?;
-            self.auth_state = AuthState::UsernameSent;
-
-            let mut end_auth_count = 0;
+            // Wait for encryptionKey from server
             let auth_start_time = Instant::now();
+            let mut received_encryption_key = false;
+            let mut end_auth_count = 0;
 
-            while self.auth_state != AuthState::Authenticated
-                && auth_start_time.elapsed() < Duration::from_secs(30)
-            {
+            while auth_start_time.elapsed() < Duration::from_secs(10) && !received_encryption_key {
+                // Check for incoming packets
                 match self.receive_packet()? {
                     Some((header, payload)) if header.ptype == PacketType::Data => {
+                        // Send ACK for received data
+                        self.send_packet(PacketType::Ack, &[])?;
+
                         if let Some(control) = self.extract_control_packet(&payload) {
                             match control.ctype {
                                 ControlPacketType::EncryptionKey => {
-                                    info!("Received EncryptionKey packet");
+                                    info!(
+                                        "Received EncryptionKey packet with size: {} bytes",
+                                        control.payload.len()
+                                    );
+                                    received_encryption_key = true;
 
                                     if control.payload.len() >= 16 {
                                         self.authenticator.set_password(self.password.clone());
 
-                                        match self.authenticator.process_encryption_key(&control) {
-                                            Ok(response) => {
-                                                info!("Sending authentication response...");
+                                        // Process encryption key and build combined response containing:
+                                        // Password + Username + TerminalType + TerminalWidth + TerminalHeight
+                                        match self
+                                            .authenticator
+                                            .process_encryption_key_complete(&control)
+                                        {
+                                            Ok(combined_response) => {
+                                                info!("Sending complete authentication response package... ({} bytes)", combined_response.len());
                                                 self.send_packet(
                                                     PacketType::Data,
-                                                    &response.to_bytes(),
+                                                    &combined_response,
                                                 )?;
                                                 self.auth_state =
                                                     AuthState::WaitingForAuthConfirmation;
+
+                                                // No need to send terminal size separately, it's included in the response
                                             }
                                             Err(e) => {
-                                                return Err(MacTelnetError::Authentication(
-                                                    format!("Error in SRP calculation: {}", e),
-                                                ));
+                                                warn!("Failed to process encryption key: {}", e);
+                                                break;
                                             }
                                         }
                                     } else {
-                                        warn!("Malformed EncryptionKey, insufficient size");
+                                        warn!(
+                                            "Received malformed EncryptionKey packet (too short)"
+                                        );
                                     }
                                 }
                                 ControlPacketType::EndAuth => {
-                                    info!("Received EndAuth packet ({})", end_auth_count + 1);
                                     end_auth_count += 1;
+                                    info!("Received EndAuth packet ({}/2)", end_auth_count);
 
                                     if end_auth_count >= 2 {
                                         info!("Authentication successful!");
                                         self.auth_state = AuthState::Authenticated;
-                                        break;
+                                        return Ok(());
                                     }
                                 }
                                 _ => {
                                     debug!(
-                                        "Received control packet type={:?}, ignored",
-                                        control.ctype
+                                        "Received control packet of type {:?}, payload size: {}",
+                                        control.ctype,
+                                        control.payload.len()
                                     );
                                 }
                             }
+                        } else if !payload.is_empty() {
+                            // Non-control packet data may contain error messages
+                            if let Ok(text) = std::str::from_utf8(&payload) {
+                                if text.contains("Login failed") || text.contains("incorrect") {
+                                    return Err(MacTelnetError::Authentication(format!(
+                                        "Authentication failed: {}",
+                                        text
+                                    )));
+                                }
+                                debug!("Received text during auth: {}", text);
+                            }
                         }
                     }
-                    _ => {
-                        if self.auth_state == AuthState::BeginAuthSent {
-                            let begin_auth = self.authenticator.generate_begin_auth();
-                            self.send_packet(PacketType::Data, &begin_auth.to_bytes())?;
-                        } else if self.auth_state == AuthState::UsernameSent {
-                            let username_packet = self.authenticator.generate_username();
-                            self.send_packet(PacketType::Data, &username_packet.to_bytes())?;
-                        }
+                    Some((header, _)) => {
+                        // Handle ACKs and other packet types
+                        debug!(
+                            "Received packet of type {:?} during authentication",
+                            header.ptype
+                        );
+                    }
+                    None => {
+                        // No packet received, wait a bit
+                        sleep(Duration::from_millis(100)).await;
                     }
                 }
-
-                sleep(Duration::from_millis(100)).await;
             }
 
-            if self.auth_state == AuthState::Authenticated {
+            // If we didn't receive an encryption key or authentication failed
+            if !received_encryption_key {
+                warn!("Did not receive encryption key from router");
+            } else if self.auth_state != AuthState::Authenticated {
+                if !self.wait_for_auth_confirmation().await? {
+                    warn!("Authentication confirmation not received");
+                } else {
+                    return Ok(());
+                }
+            } else {
                 return Ok(());
             }
 
@@ -315,6 +405,60 @@ impl Session {
         Err(MacTelnetError::Authentication(
             "Authentication failed after max retries".into(),
         ))
+    }
+
+    async fn wait_for_auth_confirmation(&mut self) -> Result<bool, MacTelnetError> {
+        let start_time = Instant::now();
+        let mut end_auth_count = 0;
+
+        while start_time.elapsed() < Duration::from_secs(20)
+            && self.auth_state != AuthState::Authenticated
+        {
+            match self.receive_packet()? {
+                Some((header, payload)) if header.ptype == PacketType::Data => {
+                    // Always ACK data packets
+                    self.send_packet(PacketType::Ack, &[])?;
+
+                    if let Some(control) = self.extract_control_packet(&payload) {
+                        match control.ctype {
+                            ControlPacketType::EndAuth => {
+                                end_auth_count += 1;
+                                info!("Received EndAuth packet ({}/2)", end_auth_count);
+
+                                if end_auth_count >= 2 {
+                                    info!("Authentication successful!");
+                                    self.auth_state = AuthState::Authenticated;
+                                    return Ok(true);
+                                }
+                            }
+                            _ => {
+                                debug!(
+                                    "Received control packet type={:?} during auth confirmation",
+                                    control.ctype
+                                );
+                            }
+                        }
+                    } else if !payload.is_empty() {
+                        // Check for error messages in the payload
+                        if let Ok(text) = std::str::from_utf8(&payload) {
+                            if text.contains("Login failed") || text.contains("incorrect") {
+                                return Err(MacTelnetError::Authentication(format!(
+                                    "Authentication failed: {}",
+                                    text
+                                )));
+                            }
+                            debug!("Received text during auth confirmation: {}", text);
+                        }
+                    }
+                }
+                _ => {
+                    // Wait a bit before checking again
+                    sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+
+        Ok(self.auth_state == AuthState::Authenticated)
     }
 
     async fn terminal_loop(&mut self) -> Result<(), MacTelnetError> {
@@ -432,7 +576,11 @@ impl Session {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
-    use pnet::{ipnetwork::IpNetwork, util::MacAddr};
+    use pnet::{
+        datalink::{self, DataLinkReceiver, DataLinkSender},
+        ipnetwork::IpNetwork,
+        util::MacAddr,
+    };
 
     use super::*;
 
@@ -444,6 +592,49 @@ mod tests {
             mac: Some(MacAddr::new(0x00, 0x11, 0x22, 0x33, 0x44, 0x55)),
             ips: vec![IpNetwork::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 24).unwrap()],
             flags: 0,
+        }
+    }
+
+    // Mock DataLinkSender for testing
+    struct MockDataLinkSender;
+
+    impl DataLinkSender for MockDataLinkSender {
+        fn build_and_send(
+            &mut self,
+            len: usize,
+            _packet_size: usize,
+            func: &mut dyn FnMut(&mut [u8]),
+        ) -> Option<io::Result<()>> {
+            let mut buffer = vec![0u8; len];
+            func(&mut buffer);
+            Some(Ok(()))
+        }
+
+        fn send_to(
+            &mut self,
+            packet: &[u8],
+            _dst: Option<NetworkInterface>,
+        ) -> Option<io::Result<()>> {
+            Some(Ok(()))
+        }
+    }
+
+    // Mock DataLinkReceiver for testing
+    struct MockDataLinkReceiver;
+
+    impl DataLinkReceiver for MockDataLinkReceiver {
+        fn next(&mut self) -> io::Result<&[u8]> {
+            // Return a predefined packet for testing
+            static PACKET: [u8; 30] = [
+                0x01, 0x01, // ver, ptype
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, // srcaddr
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x66, // dstaddr
+                0x00, 0x15, 0x00, 0x00, // seskey
+                0x00, 0x00, 0x00, 0x01, // counter
+                0x68, 0x65, 0x6c, 0x6c, 0x6f, // "hello" payload
+                0x00, 0x00, 0x00,
+            ];
+            Ok(&PACKET[..])
         }
     }
 
@@ -463,8 +654,12 @@ mod tests {
         let username = String::from("testuser");
         let mut session = Session::new(interface, dst_mac, username).unwrap();
 
-        // Create and set the channel
-        session.connect().unwrap();
+        // Instead of calling connect(), mock the channel directly
+        session.channel = Some(network::NetworkChannel {
+            interface: create_mock_interface(),
+            tx: Box::new(MockDataLinkSender {}),
+            rx: Box::new(MockDataLinkReceiver {}),
+        });
 
         assert_eq!(session.counter, 0);
         session.send_packet(PacketType::Data, &[]).unwrap();
@@ -478,8 +673,12 @@ mod tests {
         let username = String::from("testuser");
         let mut session = Session::new(interface, dst_mac, username).unwrap();
 
-        // Create and set the channel
-        session.connect().unwrap();
+        // Instead of calling connect(), mock the channel directly
+        session.channel = Some(network::NetworkChannel {
+            interface: create_mock_interface(),
+            tx: Box::new(MockDataLinkSender {}),
+            rx: Box::new(MockDataLinkReceiver {}),
+        });
 
         session.counter = u32::MAX;
         session.send_packet(PacketType::Data, &[]).unwrap();

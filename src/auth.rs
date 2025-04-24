@@ -40,6 +40,22 @@ impl Authenticator {
         )
     }
 
+    /// Generate a terminal type packet
+    pub fn generate_terminal_type(&self) -> ControlPacket {
+        // According to the protocol specification, this should be "linux"
+        ControlPacket::new(ControlPacketType::TerminalType, b"linux".to_vec())
+    }
+
+    /// Generate terminal width packet
+    pub fn generate_terminal_width(&self, width: u16) -> ControlPacket {
+        ControlPacket::new(ControlPacketType::Width, width.to_be_bytes().to_vec())
+    }
+
+    /// Generate terminal height packet
+    pub fn generate_terminal_height(&self, height: u16) -> ControlPacket {
+        ControlPacket::new(ControlPacketType::Height, height.to_be_bytes().to_vec())
+    }
+
     fn calculate_x(&self) -> Result<BigUint, MacTelnetError> {
         let password = self
             .password
@@ -123,7 +139,7 @@ impl Authenticator {
 
         // Build response
         let mut response = Vec::new();
-        response.extend_from_slice(&a_pub.to_bytes_be());
+        response.push(0); // Start with null byte as required by the protocol
         response.extend_from_slice(&client_proof);
 
         info!(
@@ -131,7 +147,79 @@ impl Authenticator {
             response.len()
         );
 
+        // Create password packet with the authentication response
+        let password_packet = ControlPacket::new(ControlPacketType::Password, response);
+
+        Ok(password_packet)
+    }
+
+    pub fn generate_password_response(
+        &self,
+        key_packet: &ControlPacket,
+    ) -> Result<ControlPacket, MacTelnetError> {
+        if key_packet.ctype != ControlPacketType::EncryptionKey {
+            return Err(MacTelnetError::Authentication(
+                "Expected encryption key packet".into(),
+            ));
+        }
+
+        // In a real implementation, this would properly calculate the SRP response
+        // using the server key and client credentials
+        let mut response = vec![0]; // Start with null byte
+
+        // For now, just hash the password with the salt
+        if let Some(password) = &self.password {
+            let mut hasher = Sha256::new();
+            hasher.update(password.as_bytes());
+            if key_packet.payload.len() >= 16 {
+                hasher.update(&key_packet.payload[0..16]); // Salt
+            }
+            let digest = hasher.finalize();
+            response.extend_from_slice(&digest);
+        } else {
+            return Err(MacTelnetError::Authentication("Password not set".into()));
+        }
+
         Ok(ControlPacket::new(ControlPacketType::Password, response))
+    }
+
+    /// Process a complete authentication response with all required packets
+    pub fn process_encryption_key_complete(
+        &self,
+        key_packet: &ControlPacket,
+    ) -> Result<Vec<u8>, MacTelnetError> {
+        if key_packet.ctype != ControlPacketType::EncryptionKey {
+            return Err(MacTelnetError::Authentication(
+                "Expected encryption key packet".into(),
+            ));
+        }
+
+        // Create password packet
+        let password_packet = self.generate_password_response(key_packet)?;
+
+        // Create username packet
+        let username_packet = self.generate_username();
+
+        // Create terminal type packet
+        let terminal_type_packet = self.generate_terminal_type();
+
+        // Get terminal size
+        let terminal_size =
+            crossterm::terminal::size().map_err(|e| MacTelnetError::Terminal(e.to_string()))?;
+
+        // Create terminal width and height packets
+        let width_packet = self.generate_terminal_width(terminal_size.0);
+        let height_packet = self.generate_terminal_height(terminal_size.1);
+
+        // Combine all packets into one response
+        let mut combined = Vec::new();
+        combined.extend_from_slice(&password_packet.to_bytes());
+        combined.extend_from_slice(&username_packet.to_bytes());
+        combined.extend_from_slice(&terminal_type_packet.to_bytes());
+        combined.extend_from_slice(&width_packet.to_bytes());
+        combined.extend_from_slice(&height_packet.to_bytes());
+
+        Ok(combined)
     }
 
     pub fn verify_server_proof(&self, proof: &[u8]) -> Result<bool, MacTelnetError> {

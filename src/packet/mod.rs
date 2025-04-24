@@ -14,6 +14,8 @@ pub enum PacketType {
     Data = 1,
     Ack = 2,
     Timeout = 3,
+    Discovery = 4,
+    DiscoveryResponse = 5,
     End = 255,
 }
 
@@ -24,6 +26,8 @@ impl From<u8> for PacketType {
             1 => PacketType::Data,
             2 => PacketType::Ack,
             3 => PacketType::Timeout,
+            4 => PacketType::Discovery,
+            5 => PacketType::DiscoveryResponse,
             255 => PacketType::End,
             _ => PacketType::End,
         }

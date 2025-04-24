@@ -11,12 +11,16 @@ pub struct Args {
     pub interface: String,
 
     /// Target router MAC address (format xx:xx:xx:xx:xx:xx)
-    #[arg(short, long)]
-    pub mac: MacAddress,
+    #[arg(short, long, required = false)]
+    pub mac: Option<MacAddress>,
 
     /// Username for authentication
     #[arg(short, long, default_value = "admin")]
     pub username: String,
+
+    /// List all available MikroTik routers on the network
+    #[arg(short = 'l', long = "list")]
+    pub list_routers: bool,
 }
 
 #[derive(Debug, Clone)]

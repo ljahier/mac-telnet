@@ -43,6 +43,14 @@ impl Header {
         }
     }
 
+    // Add a new method for creating discovery packets
+    pub fn new_discovery() -> Vec<u8> {
+        let broadcast_mac = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        let zero_mac = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let header = Header::new(zero_mac, broadcast_mac, PacketType::Start, 0, 0, false);
+        header.to_bytes()
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(22);
         bytes.push(self.ver);
@@ -217,10 +225,10 @@ mod tests {
     #[test]
     fn test_header_deserialization() {
         let bytes = [
-            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, // src_mac
-            0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, // dst_mac
             0x02, // version
             0x00, // ptype
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, // src_mac
+            0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, // dst_mac
             0x12, 0x34, 0x56, 0x78, // seskey
             0x00, 0x00, 0x00, 0x01, // counter
         ];
